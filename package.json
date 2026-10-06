@@ -1,0 +1,8 @@
+{
+  "name": "anime-frame",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build-sites.mjs"
+  }
+}

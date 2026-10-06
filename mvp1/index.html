@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Anime Frame</title>
+<style>
+  :root { --bg:#0e0e10; --fg:#f4f1ea; --accent:#ffb7c5; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: ui-rounded, system-ui, sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas#out { max-width:100vw; max-height:100vh; }
+  /* kept "visible" (Chrome pauses hidden muted video), but effectively invisible */
+  video { position:fixed; left:0; top:0; width:2px; height:2px; opacity:.01; pointer-events:none; }
+  #hud { position:fixed; left:16px; bottom:16px; font-size:13px; opacity:.92; max-width:min(440px, calc(100vw - 32px));
+    background:rgba(0,0,0,.55); padding:8px 12px; border-radius:10px; backdrop-filter:blur(6px); }
+  #hud b { color:var(--accent); }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; gap:14px;
+    align-items:center; justify-content:center; background:var(--bg); z-index:2; text-align:center; padding:16px; }
+  #start button { font:inherit; font-size:18px; padding:12px 26px; border-radius:999px; border:0;
+    background:var(--accent); color:#222; cursor:pointer; }
+  #start p { max-width:440px; opacity:.75; line-height:1.5; margin:0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; align-items:center; }
+  .row button, .row select { font:inherit; font-size:12px; padding:4px 10px; border-radius:6px; border:1px solid #fff4;
+    background:transparent; color:var(--fg); cursor:pointer; }
+  .row select option { background:#222; }
+  .panel { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:5px 10px; margin-top:8px; align-items:center; }
+  .panel[hidden] { display:none; }
+  .panel input { width:100%; accent-color:var(--accent); }
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>📸 Anime Frame</h1>
+  <p>Make an <b>L</b> with each hand (thumb + index) to form a frame. Everything inside the frame turns into a cartoon, live.</p>
+  <p>Pick <b>Anime</b> or <b>Pixar toon</b> once it's running (restyled live by Decart).</p>
+  <button id="go">Start camera</button>
+  <small id="err"></small>
+</div>
+<div id="stage"><canvas id="out"></canvas></div>
+<video id="cam" playsinline muted></video>
+<video id="liveVid" playsinline muted autoplay></video>
+<div id="hud">
+  <div id="status">loading hand tracker…</div>
+  <div class="row">
+    <select id="look" aria-label="Look">
+      <option value="anime">Anime</option>
+      <option value="pixar">Pixar toon</option>
+      <option value="filter">Filter only (offline)</option>
+    </select>
+    <button id="snap">Snapshot</button>
+    <button id="always">Full frame: off</button>
+    <button id="styleBtn">Filter style</button>
+  </div>
+  <div id="style" class="panel" hidden>
+    <label for="s_smooth">Smooth skin</label><input id="s_smooth" type="range" min="0" max="1" step="0.01">
+    <label for="s_lines">Outlines</label><input id="s_lines" type="range" min="0" max="1" step="0.01">
+    <label for="s_pop">Color pop</label><input id="s_pop" type="range" min="0" max="1" step="0.01">
+    <label for="s_bg">Background blur</label><input id="s_bg" type="range" min="0" max="1" step="0.01">
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { createToon } from "./toon.js";
+import { createLive, STYLES } from "./live.js";
+
+const $ = (id) => document.getElementById(id);
+const video = $('cam');
+const out = $('out');
+const ctx = out.getContext('2d');
+const statusEl = $('status');
+const query = new URLSearchParams(location.search);
+let fullAnime = query.has('full');
+
+// Offline filter knobs (0..1). The filter is the "Filter only" look and the stand-in while Decart connects.
+const P = { smooth: 0.6, lines: 0.8, pop: 0.5, bg: 0.6 };
+window.P = P;
+const glc = document.createElement('canvas');
+const toon = createToon(glc);
+
+/* ---------------- live restyle (Decart) ---------------- */
+const liveVid = $('liveVid');
+const live = createLive(liveVid);
+let look = 'anime';
+try { look = localStorage.getItem('animeFrame.look') || look; } catch {}
+if (!STYLES[look] && look !== 'filter') look = 'anime';
+let camStream = null, lastActive = 0, retryAt = 0, wasLive = false, liveFadeAt = 0;
+
+// hang up after 30 s without a frame: the session is billed while it streams
+setInterval(() => { if (live.st.rt && performance.now() - lastActive > 30000) live.disconnect(); }, 5000);
+addEventListener('pagehide', () => live.disconnect());
+
+/* ---------------- person segmentation (for the filter's background blur) ---------------- */
+let segmenter = null, maskF = null, maskU8 = null;
+function updateMask(ts) {
+  segmenter.segmentForVideo(video, ts, (res) => {
+    const ms = res.confidenceMasks;
+    if (!ms || !ms.length) return;
+    // single-mask models give person confidence; multi-class models put background at index 0
+    const mk = ms[0], inv = ms.length > 1, src = mk.getAsFloat32Array();
+    if (!maskF || maskF.length !== src.length) { maskF = new Float32Array(src.length); maskU8 = new Uint8Array(src.length); }
+    for (let i = 0; i < src.length; i++) {
+      maskF[i] = maskF[i] * 0.35 + (inv ? 1 - src[i] : src[i]) * 0.65;   // temporal smoothing, kills flicker
+      maskU8[i] = maskF[i] * 255;
+    }
+    toon.setMask(maskU8, mk.width, mk.height);
+  });
+}
+
+/* ---------------- Frame geometry from two "L" hands ---------------- */
+// landmarks: 2 thumb MCP, 4 thumb tip, 5 index MCP, 8 index tip
+const W = () => out.width, H = () => out.height;
+const pt = (lm) => ({ x: (1 - lm.x) * W(), y: lm.y * H() }); // mirrored to match display
+const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y }), add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y }), mul = (a, k) => ({ x: a.x * k, y: a.y * k });
+const cross = (a, b) => a.x * b.y - a.y * b.x, dot = (a, b) => a.x * b.x + a.y * b.y;
+const len = (a) => Math.hypot(a.x, a.y), unit = (a) => mul(a, 1 / (len(a) || 1));
+function intersect(p, d, q, e) { const den = cross(d, e); if (Math.abs(den) < 1e-6) return null;
+  const t = cross(sub(q, p), e) / den; return add(p, mul(d, t)); }
+function convex(q) {
+  const s = q.map((p, i) => Math.sign(cross(sub(q[(i + 1) % 4], p), sub(q[(i + 2) % 4], q[(i + 1) % 4]))));
+  return s.every(v => v !== 0 && v === s[0]);
+}
+
+function handL(lms) {
+  const [t2, t3, t4, i5, tip] = [2, 3, 4, 5, 8].map(i => pt(lms[i]));
+  // the L's vertex: where the index-finger line meets the thumb line (falls back to the knuckle midpoint)
+  const mid = mul(add(t2, i5), .5), v = intersect(i5, sub(tip, i5), t3, sub(t4, t3));
+  const corner = v && len(sub(v, mid)) < len(sub(tip, i5)) ? v : mid;
+  return { corner, tip, index: sub(tip, corner), thumb: sub(t4, corner) };
+}
+let smooth = null, mode = '';
+function frameQuad(hands) {
+  if (hands.length < 2) return null;
+  // MediaPipe's hand order can flip between frames; keep the left-most hand first
+  const [A, B] = [handL(hands[0]), handL(hands[1])].sort((a, b) => a.corner.x - b.corner.x);
+  const span = len(sub(A.corner, B.corner)), mid = mul(add(A.corner, B.corner), .5);
+  if (span < 60) return null;
+  let q, m;
+  if (dot(unit(A.index), unit(B.index)) > 0.3) {
+    // both L's the same way up (like the video): sides run along the index fingers, top joins the fingertips
+    q = [A.corner, A.tip, B.tip, B.corner]; m = 'upright';
+  } else {
+    // director's frame (one hand flipped): the other two corners are where one hand's index line meets the other's thumb line
+    q = [A.corner, intersect(A.corner, A.index, B.corner, B.thumb), B.corner, intersect(B.corner, B.index, A.corner, A.thumb)]; m = 'director';
+  }
+  if (q.some(p => !p || len(sub(p, mid)) > span * 1.5) || !convex(q)) {
+    // odd pose: fall back to the box around both hands' corners and fingertips
+    const ps = [A.corner, A.tip, B.corner, B.tip], xs = ps.map(p => p.x), ys = ps.map(p => p.y);
+    const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+    q = [{ x: x0, y: y0 }, { x: x1, y: y0 }, { x: x1, y: y1 }, { x: x0, y: y1 }]; m = 'box';
+  }
+  if (m !== mode) { smooth = null; mode = m; }   // corner order differs per mode; never blend across it
+  smooth = smooth ? smooth.map((s, i) => add(mul(s, .55), mul(q[i], .45))) : q;
+  return smooth;
+}
+
+/* ---------------- main loop ---------------- */
+let landmarker, lastT = -1, quad = null, lost = 0, lastStatus = '';
+async function init() {
+  const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await HandLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2,
+  });
+  try {
+    segmenter = await ImageSegmenter.createFromOptions(files, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite", delegate: "GPU" },
+      runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false,
+    });
+  } catch (e) { console.warn('segmenter unavailable, background blur off', e); }
+}
+
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function updateStatus(active) {
+  const L = live.st;
+  let s;
+  if (!landmarker) s = 'loading hand tracker…';
+  else if (!active) s = 'Make an <b>L</b> with both hands to frame';
+  else if (look === 'filter') s = '✨ <b>anime filter</b>';
+  else if (live.ready()) s = `✨ <b>${STYLES[look].label}</b> · live`;
+  else if (L.err) s = `✨ <b>filter</b> · Decart: ${esc(L.err)}`;
+  else if (L.queue?.position) s = `⏳ Decart queue: #${L.queue.position} of ${L.queue.queueSize}…`;
+  else s = '🎨 connecting to Decart…';
+  if (s !== lastStatus) { statusEl.innerHTML = s; lastStatus = s; }
+}
+
+function frame() {
+  if (video.readyState < 2) return;
+  if (out.width !== video.videoWidth || out.height !== video.videoHeight) {
+    out.width = video.videoWidth; out.height = video.videoHeight;
+  }
+  const now = performance.now();
+  const fresh = video.currentTime !== lastT;
+  if (landmarker && fresh) {
+    lastT = video.currentTime;
+    const r = landmarker.detectForVideo(video, now);
+    const q = frameQuad(r.landmarks || []);
+    if (q) { quad = q; lost = 0; } else if (++lost > 6) { quad = null; smooth = null; }
+  }
+  const active = !!quad || fullAnime;
+  if (active) lastActive = now;
+  if (active && look !== 'filter' && camStream && !live.st.rt && !live.st.connecting && now >= retryAt) {
+    live.connect(camStream, look).catch(() => { retryAt = performance.now() + 10000; });
+  }
+  updateStatus(active);
+
+  // real (mirrored) camera
+  ctx.save(); ctx.translate(W(), 0); ctx.scale(-1, 1); ctx.drawImage(video, 0, 0, W(), H()); ctx.restore();
+  if (!active) return;
+
+  const showLive = look !== 'filter' && live.ready();
+  if (showLive && !wasLive) liveFadeAt = now;
+  wasLive = showLive;
+  if (!showLive) {                     // offline filter (also the stand-in while Decart connects)
+    if (!toon) return;
+    if (segmenter && fresh && P.bg > 0.01) updateMask(now);
+    toon.render(video, P);
+  }
+  const framed = quad && !fullAnime;
+  const path = () => { ctx.beginPath(); quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); };
+  ctx.save();
+  if (framed) { path(); ctx.clip(); }
+  if (showLive) {                      // Decart returns the unmirrored view; mirror it like the camera
+    ctx.globalAlpha = Math.min(1, (now - liveFadeAt) / 300);
+    ctx.translate(W(), 0); ctx.scale(-1, 1); ctx.drawImage(liveVid, 0, 0, W(), H());
+  } else {
+    ctx.drawImage(glc, 0, 0, W(), H());
+  }
+  ctx.restore();
+  if (framed) {
+    const waiting = look !== 'filter' && !showLive && !live.st.err;
+    const alpha = waiting ? 0.55 + 0.35 * Math.sin(now / 180) : 0.9;   // border breathes while connecting
+    ctx.strokeStyle = `rgba(255,255,255,${alpha})`; ctx.lineWidth = 3; path(); ctx.stroke();
+  }
+}
+function loop() { frame(); requestAnimationFrame(loop); }
+
+async function start() {
+  if (!toon) statusEl.textContent = 'WebGL2 is not available in this browser';
+  if (query.get('src')) {          // test hook: ?src=clip.mp4 plays a file instead of the webcam
+    video.src = query.get('src'); video.loop = true;
+    window.__af = { frame, state: () => ({ hands: !!landmarker, seg: !!segmenter, quad: !!quad,
+      live: { state: live.st.state, err: live.st.err, ready: live.ready(), w: liveVid.videoWidth, h: liveVid.videoHeight } }) };
+    await video.play().catch(() => {});   // may be refused in a background tab; frames can still be stepped
+    camStream = video.captureStream?.() || null;
+  } else {
+    camStream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, frameRate: { ideal: 30 }, facingMode: 'user' }, audio: false });
+    video.srcObject = camStream;
+    await video.play();
+  }
+  $('start').remove();
+  loop(); init().catch(e => statusEl.textContent = 'hand tracker failed: ' + e);
+}
+$('go').onclick = () => start().catch(e => $('err').textContent = 'Camera error: ' + e.message);
+if (query.get('src')) $('go').click();
+
+/* ---------------- controls ---------------- */
+$('look').value = look;
+$('look').onchange = (e) => {
+  look = e.target.value;
+  try { localStorage.setItem('animeFrame.look', look); } catch {}
+  live.st.err = ''; retryAt = 0;
+  if (look === 'filter') live.disconnect(); else live.setStyle(look);   // no-op if not connected yet
+};
+const alwaysBtn = $('always');
+const syncAlways = () => alwaysBtn.textContent = 'Full frame: ' + (fullAnime ? 'on' : 'off');
+alwaysBtn.onclick = () => { fullAnime = !fullAnime; syncAlways(); };
+syncAlways();
+$('snap').onclick = () => { const a = document.createElement('a'); a.download = 'anime-frame.png'; a.href = out.toDataURL('image/png'); a.click(); };
+$('styleBtn').onclick = () => { $('style').hidden = !$('style').hidden; };
+for (const k of Object.keys(P)) {
+  const el = $('s_' + k);
+  el.value = P[k]; el.oninput = () => P[k] = +el.value;
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,578 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Anime Frame</title>
+<style>
+  :root { --bg:#0e0e10; --fg:#f4f1ea; --accent:#ffb7c5; --rec:#e5484d; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: ui-rounded, system-ui, sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas#out { max-width:100vw; max-height:100vh; }
+  /* kept "visible" (Chrome pauses hidden muted video), but effectively invisible */
+  video { position:fixed; left:0; top:0; width:2px; height:2px; opacity:.01; pointer-events:none; }
+  #hud { position:fixed; left:16px; bottom:16px; font-size:13px; opacity:.94; width:min(500px, calc(100vw - 32px)); box-sizing:border-box;
+    background:rgba(0,0,0,.6); padding:8px 12px; border-radius:10px; backdrop-filter:blur(6px); }
+  #hud b { color:var(--accent); }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; gap:14px;
+    align-items:center; justify-content:center; background:var(--bg); z-index:2; text-align:center; padding:16px; }
+  #start .actions { display:flex; flex-wrap:wrap; gap:10px; justify-content:center; }
+  #start button { font:inherit; font-size:18px; padding:12px 26px; border-radius:999px; border:0;
+    background:var(--accent); color:#222; cursor:pointer; }
+  #start button.alt { background:transparent; color:var(--fg); border:1px solid #fff5; }
+  #start p { max-width:440px; opacity:.75; line-height:1.5; margin:0; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:6px; align-items:center; }
+  #hud button, #hud select, #hud input:not([type=range]):not([type=checkbox]) { font:inherit; font-size:12px; padding:4px 10px;
+    border-radius:6px; border:1px solid #fff4; background:transparent; color:var(--fg); cursor:pointer; }
+  #hud input:not([type=range]):not([type=checkbox]) { cursor:text; background:#0006; }
+  #hud button:disabled { opacity:.4; cursor:default; }
+  #hud select option { background:#222; }
+  #hud button[aria-pressed="true"] { background:var(--accent); color:#222; border-color:var(--accent); }
+  #hud #rec[aria-pressed="true"] { background:var(--rec); border-color:var(--rec); color:#fff; }
+  .row [hidden] { display:none; }
+  .prompt { flex-wrap:nowrap; }
+  .prompt input { flex:1; min-width:0; }
+  .chk { display:flex; align-items:center; gap:4px; font-size:12px; white-space:nowrap; cursor:pointer; }
+  .chk input { accent-color:var(--accent); margin:0; }
+  .tipwrap { position:relative; }
+  .tip { display:none; position:absolute; right:0; bottom:calc(100% + 8px); width:min(350px, calc(100vw - 48px)); box-sizing:border-box;
+    padding:10px 12px; border-radius:8px; background:#1d1d22; border:1px solid #fff3; font-size:12px; line-height:1.45;
+    box-shadow:0 8px 24px #0008; z-index:5; }
+  .tip ul { margin:6px 0 0; padding-left:16px; }
+  .tip li { margin:4px 0; }
+  .tipwrap:hover .tip, .tipwrap:focus-within .tip, .tip.open { display:block; }
+  .panel { margin-top:8px; padding-top:8px; border-top:1px solid #fff2; }
+  .panel[hidden] { display:none; }
+  .panel-head { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:6px; }
+  .panel-head small, .note { opacity:.7; font-size:11px; line-height:1.4; }
+  .grid { display:grid; grid-template-columns:auto minmax(0, 1fr); gap:5px 10px; align-items:center; }
+  .grid input { width:100%; accent-color:var(--accent); }
+  .keyrows { display:grid; grid-template-columns:auto minmax(0, 1fr) auto auto; gap:4px 6px; align-items:center; }
+  .keyrows .kstat { grid-column:2 / -1; font-size:11px; opacity:.85; min-height:0; margin:-1px 0 3px; }
+  .keyrows .kstat:empty { display:none; }
+  .ok { color:#7ddc8a; } .bad { color:#ff8f8f; }
+  /* drag a video anywhere onto the page */
+  body.dragging::after { content:"Drop a video to restyle it"; position:fixed; inset:12px; z-index:3; display:flex;
+    align-items:center; justify-content:center; font-size:22px; border:3px dashed var(--accent); border-radius:16px;
+    background:rgba(14,14,16,.75); pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="start">
+  <h1>📸 Anime Frame</h1>
+  <p>Make an <b>L</b> with each hand (thumb + index) to form a frame. Everything inside the frame turns into a cartoon, live.</p>
+  <p>Pick <b>Anime</b>, <b>Pixar toon</b> or your own prompt once it's running (restyled live by Decart). Works on your camera or on a video file.</p>
+  <div class="actions">
+    <button id="go">Start camera</button>
+    <button id="goFile" class="alt">📁 Upload a video</button>
+  </div>
+  <small id="err"></small>
+</div>
+<div id="stage"><canvas id="out"></canvas></div>
+<video id="cam" playsinline muted></video>
+<video id="liveVid" playsinline muted autoplay></video>
+<input id="file" type="file" hidden
+  accept="video/*,.mp4,.m4v,.mov,.webm,.mkv,.avi,.wmv,.asf,.flv,.f4v,.3gp,.3g2,.mpg,.mpeg,.m2v,.ts,.mts,.m2ts,.vob,.ogv,.mxf,.rm,.rmvb,.divx,.dv,.y4m,.gif">
+<div id="hud">
+  <div id="status">loading hand tracker…</div>
+  <div class="row">
+    <select id="look" aria-label="Look">
+      <option value="anime">Anime</option>
+      <option value="pixar">Pixar toon</option>
+      <option value="custom">Custom prompt</option>
+      <option value="filter">Filter only (offline)</option>
+    </select>
+    <button id="fast" aria-pressed="false" title="Decart fast mode: lower latency, billed at 2x">⚡ Fast</button>
+    <button id="always" aria-pressed="false">Full frame</button>
+    <button id="rec" aria-pressed="false" title="Record the output; saved to your Downloads folder as MP4">⏺ Record</button>
+    <button id="snap">Snapshot</button>
+  </div>
+  <form id="promptForm" class="row prompt" autocomplete="off">
+    <input id="prompt" maxlength="750" aria-label="Custom prompt" placeholder="Custom style, e.g. Transform the entire scene into a watercolor painting">
+    <label class="chk" title="Let Decart expand your prompt (recommended)"><input id="enhance" type="checkbox" checked> Enhance</label>
+    <button type="submit">Apply</button>
+    <span class="tipwrap">
+      <button type="button" id="tipBtn" aria-label="Prompt tips" aria-describedby="tip" aria-expanded="false">ⓘ</button>
+      <div id="tip" class="tip" role="tooltip">
+        <b>Prompt tips</b> (from Decart's docs)
+        <ul>
+          <li>Describe the look with concrete visual details: medium, line work, colours, lighting.</li>
+          <li><b>Standard</b> model: short style phrases work, e.g. "Studio Ghibli animation style" or "Cyberpunk city".</li>
+          <li><b>⚡ Fast</b> model: describe a whole-scene change, e.g. "Transform the entire scene into a watercolor painting". Leave out studio, brand and character names here; they're refused as copyrighted.</li>
+          <li>One idea per prompt. Skip filler like "realistic" or "seamless", and name things by what they look like, not "it" or "this".</li>
+          <li>Up to about 750 characters. Keep <b>Enhance</b> on so Decart expands short prompts; turn it off for exact wording.</li>
+          <li>Prompts apply live, without reconnecting.</li>
+        </ul>
+      </div>
+    </span>
+  </form>
+  <div class="row">
+    <button id="upload">📁 Upload video</button>
+    <button id="pause" hidden>⏸ Pause</button>
+    <button id="useCam" hidden>🎥 Use camera</button>
+    <button id="styleBtn" aria-expanded="false" aria-controls="style">Filter settings</button>
+    <button id="keysBtn" aria-expanded="false" aria-controls="keys">⚙ Decart keys</button>
+  </div>
+  <div id="style" class="panel" hidden>
+    <div class="panel-head">
+      <small>Offline filter (also shown while Decart connects)</small>
+      <button type="button" data-close="style" aria-label="Close filter settings">✕ Close</button>
+    </div>
+    <div class="grid">
+      <label for="s_smooth">Smooth skin</label><input id="s_smooth" type="range" min="0" max="1" step="0.01">
+      <label for="s_lines">Outlines</label><input id="s_lines" type="range" min="0" max="1" step="0.01">
+      <label for="s_pop">Color pop</label><input id="s_pop" type="range" min="0" max="1" step="0.01">
+      <label for="s_bg">Background blur</label><input id="s_bg" type="range" min="0" max="1" step="0.01">
+    </div>
+  </div>
+  <div id="keys" class="panel" hidden>
+    <div class="panel-head">
+      <small>Decart API keys: tried in order, and if one fails the next takes over</small>
+      <button type="button" data-close="keys" aria-label="Close Decart keys">✕ Close</button>
+    </div>
+    <div id="keyRows" class="keyrows"></div>
+    <div class="row">
+      <button type="button" id="keysSave">Save keys</button>
+      <span class="note">Stored in anime-frame/.env on this computer; the page only sees masked keys. Test opens a real session for a few seconds.</span>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { FilesetResolver, HandLandmarker, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { createToon } from "./toon.js";
+import { createLive, testConnection, STYLES } from "./live.js";
+import { createFrameTracker } from "./handframe.js";
+
+const $ = (id) => document.getElementById(id);
+const video = $('cam');
+const out = $('out');
+const ctx = out.getContext('2d');
+const statusEl = $('status');
+const query = new URLSearchParams(location.search);
+let fullAnime = query.has('full');
+
+const store = {
+  get: (k, d) => { try { return localStorage.getItem('animeFrame.' + k) ?? d; } catch { return d; } },
+  set: (k, v) => { try { localStorage.setItem('animeFrame.' + k, v); } catch {} },
+};
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const post = (url, body) => fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Anime-Frame': '1' }, body: JSON.stringify(body) });
+
+// Offline filter knobs (0..1). The filter is the "Filter only" look and the stand-in while Decart connects.
+const P = { smooth: 0.6, lines: 0.8, pop: 0.5, bg: 0.6 };
+window.P = P;
+const glc = document.createElement('canvas');
+const toon = createToon(glc);
+
+/* ---------------- source: camera or video file ---------------- */
+let source = null;          // 'camera' | 'file'
+let mirror = true;          // selfie camera is shown mirrored; video files as recorded
+let camera = null;          // camera MediaStream, stopped when a file takes over
+let fileURL = null, fileName = '', loadSeq = 0;
+let camStream = null;       // what Decart restyles: the camera, or a capture of the playing file
+let feed = null;            // canvas copy of the video, for browsers that can't capture a <video> directly
+
+// transient status line message (loading, converting, saving, errors); ms = 0 keeps it until replaced
+let notice = '', noticeTimer = 0;
+function flash(html, ms = 6000) {
+  notice = html; clearTimeout(noticeTimer);
+  if (ms) noticeTimer = setTimeout(() => { if (notice === html) notice = ''; }, ms);
+  if (started) updateStatus(false);
+}
+
+/* ---------------- live restyle (Decart) ---------------- */
+const liveVid = $('liveVid');
+const live = createLive(liveVid);
+const LABEL = { anime: 'Anime', pixar: 'Pixar toon', custom: 'Custom' };
+let look = store.get('look', 'anime');
+if (!LABEL[look] && look !== 'filter') look = 'anime';
+let fast = store.get('fast', '0') === '1';
+let customPrompt = store.get('prompt', ''), customEnhance = store.get('enhance', '1') !== '0';
+if (look === 'custom' && !customPrompt) look = 'anime';
+let lastActive = 0, retryAt = 0, wasLive = false, liveFadeAt = 0;
+
+// the prompt Decart should use for the current look and mode
+function spec() {
+  if (look === 'custom' && customPrompt) return { prompt: customPrompt, enhance: customEnhance, tag: 'custom' };
+  const k = STYLES[look] ? look : 'anime';
+  return { prompt: STYLES[k][fast ? 'fast' : 'standard'], enhance: true, tag: k };
+}
+
+// hang up after 30 s without a frame: the session is billed while it streams
+setInterval(() => { if (live.st.rt && performance.now() - lastActive > 30000) live.disconnect(); }, 5000);
+addEventListener('pagehide', () => { stopRecording(); live.disconnect(); });
+
+/* ---------------- person segmentation (for the filter's background blur) ---------------- */
+let segmenter = null, maskF = null, maskU8 = null;
+function updateMask(ts) {
+  segmenter.segmentForVideo(video, ts, (res) => {
+    const ms = res.confidenceMasks;
+    if (!ms || !ms.length) return;
+    // single-mask models give person confidence; multi-class models put background at index 0
+    const mk = ms[0], inv = ms.length > 1, src = mk.getAsFloat32Array();
+    if (!maskF || maskF.length !== src.length) { maskF = new Float32Array(src.length); maskU8 = new Uint8Array(src.length); }
+    for (let i = 0; i < src.length; i++) {
+      maskF[i] = maskF[i] * 0.35 + (inv ? 1 - src[i] : src[i]) * 0.65;   // temporal smoothing, kills flicker
+      maskU8[i] = maskF[i] * 255;
+    }
+    toon.setMask(maskU8, mk.width, mk.height);
+  });
+}
+
+/* ---------------- main loop ---------------- */
+const W = () => out.width, H = () => out.height;
+const tracker = createFrameTracker();
+let landmarker, lastT = -1, quad = null, lost = 0, lastStatus = '', framedOnce = false;
+async function init() {
+  const files = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  landmarker = await HandLandmarker.createFromOptions(files, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2,
+  });
+  try {
+    segmenter = await ImageSegmenter.createFromOptions(files, {
+      baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter_landscape/float16/latest/selfie_segmenter_landscape.tflite", delegate: "GPU" },
+      runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false,
+    });
+  } catch (e) { console.warn('segmenter unavailable, background blur off', e); }
+}
+
+function updateStatus(active) {
+  const L = live.st;
+  let s;
+  if (notice) s = notice;
+  else if (!landmarker) s = 'loading hand tracker…';
+  else if (!active) s = source === 'file' && !framedOnce
+    ? `▶ <b>${esc(fileName)}</b> · no L-frame yet · press <b>Full frame</b> to restyle the whole video`
+    : 'Make an <b>L</b> with both hands to frame';
+  else if (look === 'filter') s = '✨ <b>anime filter</b>';
+  else if (live.ready()) s = `✨ <b>${LABEL[L.tag] || LABEL[look]}</b> · live${L.fast ? ' ⚡' : ''}${L.key > 0 ? ` · key ${L.key + 1}` : ''}` + (L.err ? ` · ⚠ ${esc(L.err)}` : '');
+  else if (L.err) s = `✨ <b>filter</b> · Decart: ${esc(L.err)}`;
+  else if (L.queue?.position) s = `⏳ Decart queue: #${L.queue.position} of ${L.queue.queueSize}…`;
+  else s = `🎨 connecting to Decart${fast ? ' (fast)' : ''}…`;
+  if (s !== lastStatus) { statusEl.innerHTML = s; lastStatus = s; }
+}
+
+// draw an image across the canvas, mirrored for the selfie camera
+function drawSource(img) {
+  ctx.save();
+  if (mirror) { ctx.translate(W(), 0); ctx.scale(-1, 1); }
+  ctx.drawImage(img, 0, 0, W(), H());
+  ctx.restore();
+}
+
+function frame() {
+  if (video.readyState < 2 || !video.videoWidth) return;
+  const k = Math.min(1, 1920 / video.videoWidth);       // keep huge uploads (4K) cheap to draw
+  const cw = Math.round(video.videoWidth * k), ch = Math.round(video.videoHeight * k);
+  if (out.width !== cw || out.height !== ch) { out.width = cw; out.height = ch; }
+  if (feed) {                                            // capture fallback: copy the frame Decart should see
+    if (feed.width !== video.videoWidth) { feed.width = video.videoWidth; feed.height = video.videoHeight; }
+    feed.getContext('2d').drawImage(video, 0, 0);
+  }
+  const now = performance.now();
+  const fresh = video.currentTime !== lastT;
+  if (landmarker && fresh) {
+    lastT = video.currentTime;
+    const r = landmarker.detectForVideo(video, now);
+    const q = tracker.update(r.landmarks || [], W(), H(), mirror);
+    if (q) { quad = q; lost = 0; framedOnce = true; } else if (++lost > 6) { quad = null; tracker.reset(); }
+  }
+  const active = !!quad || fullAnime;
+  const streaming = active && look !== 'filter' && !(source === 'file' && video.paused);   // when a live session is worth paying for
+  if (streaming) lastActive = now;
+  if (live.st.rt && (look === 'filter' || live.st.fast !== fast)) reconnect();   // look/mode changed under a running session
+  if (streaming && camStream && !live.st.rt && !live.st.connecting && now >= retryAt) {
+    live.connect(camStream, spec(), fast).catch(() => { retryAt = performance.now() + 10000; });
+  }
+  updateStatus(active);
+
+  drawSource(video);
+  if (!active) return;
+
+  const showLive = look !== 'filter' && live.ready();
+  if (showLive && !wasLive) liveFadeAt = now;
+  wasLive = showLive;
+  if (!showLive) {                     // offline filter (also the stand-in while Decart connects)
+    if (!toon) return;
+    if (segmenter && fresh && P.bg > 0.01) updateMask(now);
+    toon.render(video, P, mirror);
+  }
+  const framed = quad && !fullAnime;
+  const path = () => { ctx.beginPath(); quad.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); ctx.closePath(); };
+  ctx.save();
+  if (framed) { path(); ctx.clip(); }
+  if (showLive) {                      // Decart returns the frame as it was sent (unmirrored)
+    ctx.globalAlpha = Math.min(1, (now - liveFadeAt) / 300);
+    drawSource(liveVid);
+  } else {
+    ctx.drawImage(glc, 0, 0, W(), H());   // the filter already applied the mirror
+  }
+  ctx.restore();
+  if (framed) {
+    const waiting = look !== 'filter' && !showLive && !live.st.err;
+    const alpha = waiting ? 0.55 + 0.35 * Math.sin(now / 180) : 0.9;   // border breathes while connecting
+    ctx.strokeStyle = `rgba(255,255,255,${alpha})`; ctx.lineWidth = 3; path(); ctx.stroke();
+  }
+}
+function loop() { frame(); requestAnimationFrame(loop); }
+
+let started = false;
+function begin() {                     // first source chosen: start the render loop and the models
+  if (started) return;
+  started = true;
+  $('start').remove();
+  loop(); init().catch(e => statusEl.textContent = 'hand tracker failed: ' + e);
+}
+function sourceChanged() {
+  stopRecording();                     // the canvas size may change; keep each recording to one source
+  tracker.reset(); quad = null; lost = 0; lastT = -1; framedOnce = false;
+  live.st.err = ''; retryAt = 0; live.disconnect();   // the next framed moment reconnects with the new source
+  $('pause').hidden = source !== 'file'; $('useCam').hidden = source !== 'file';
+  $('pause').textContent = '⏸ Pause';
+}
+
+async function useCamera() {
+  const s = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, frameRate: { ideal: 30 }, facingMode: 'user' }, audio: false });
+  loadSeq++;
+  if (fileURL) { URL.revokeObjectURL(fileURL); fileURL = null; }
+  video.removeAttribute('src'); video.loop = false; video.srcObject = s;
+  camera = camStream = s; feed = null; source = 'camera'; mirror = true;
+  await video.play();
+  sourceChanged(); begin();
+}
+
+// Can this browser decode the file as-is? (first frame within a few seconds)
+function playable(url) {
+  return new Promise((resolve) => {
+    const v = document.createElement('video');
+    const done = (ok) => { clearTimeout(t); v.removeAttribute('src'); v.load(); resolve(ok); };
+    const t = setTimeout(() => done(false), 8000);
+    v.muted = true; v.preload = 'auto';
+    v.onloadeddata = () => done(v.videoWidth > 0);
+    v.onerror = () => done(false);
+    v.src = url;
+  });
+}
+
+async function playURL(url, name) {
+  video.srcObject = null; video.loop = true; video.src = url;
+  await video.play().catch(() => {});   // muted, so autoplay is allowed; a background tab may still refuse
+  camera?.getTracks().forEach((t) => t.stop()); camera = null;   // release the webcam
+  camStream = video.captureStream?.() || video.mozCaptureStream?.() || null;
+  feed = null;
+  if (!camStream) { feed = document.createElement('canvas'); camStream = feed.captureStream(30); }
+  source = 'file'; mirror = false; fileName = name;
+  sourceChanged(); begin();
+}
+
+async function openFile(file) {
+  const seq = ++loadSeq;
+  const say = (html) => { if (started) flash(html, 0); else $('err').innerHTML = html; };
+  say(`⏳ opening <b>${esc(file.name)}</b>…`);
+  try {
+    let url = URL.createObjectURL(file);
+    if (!(await playable(url))) {
+      URL.revokeObjectURL(url);
+      say(`🔄 converting <b>${esc(file.name)}</b> (this format doesn't play in the browser)… large files take a while`);
+      const res = await fetch('/api/convert', { method: 'POST', headers: { 'X-Filename': encodeURIComponent(file.name), 'X-Anime-Frame': '1' }, body: file });
+      if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || `conversion failed (${res.status})`);
+      url = URL.createObjectURL(await res.blob());
+      if (!(await playable(url))) throw new Error('the converted video still would not play');
+    }
+    if (seq !== loadSeq) { URL.revokeObjectURL(url); return; }   // a newer file or the camera took over
+    if (fileURL) URL.revokeObjectURL(fileURL);
+    fileURL = url;
+    await playURL(url, file.name);
+    notice = ''; if (!started) $('err').innerHTML = '';
+  } catch (e) {
+    if (seq !== loadSeq) return;
+    const msg = `⚠ couldn't open <b>${esc(file.name)}</b>: ${esc(e.message || e)}`;
+    if (started) flash(msg, 8000); else $('err').innerHTML = msg;
+  }
+}
+
+/* ---------------- recording (saved to ~/Downloads as MP4 by the local server) ---------------- */
+let rec = null;
+const clock = (ms) => { const s = Math.floor(ms / 1000); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+function syncRec() {
+  $('rec').setAttribute('aria-pressed', String(!!rec));
+  $('rec').textContent = rec ? `⏹ Stop ${clock(performance.now() - rec.t0)}` : '⏺ Record';
+}
+setInterval(() => { if (rec) syncRec(); }, 500);
+function startRecording() {
+  if (!started || typeof MediaRecorder === 'undefined' || !out.captureStream) { flash('⚠ recording is not supported in this browser'); return; }
+  const stream = out.captureStream(30);
+  const mime = ['video/mp4;codecs=avc1.640028', 'video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm']
+    .find((t) => MediaRecorder.isTypeSupported(t)) || '';
+  const mr = new MediaRecorder(stream, { ...(mime ? { mimeType: mime } : {}), videoBitsPerSecond: 8_000_000 });
+  const chunks = [];
+  mr.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  mr.onstop = () => {
+    stream.getTracks().forEach((t) => t.stop());
+    saveRecording(new Blob(chunks, { type: mr.mimeType || mime || 'video/webm' }));
+  };
+  mr.start(1000);
+  rec = { mr, t0: performance.now() };
+  syncRec();
+}
+function stopRecording() {
+  if (!rec) return;
+  rec.mr.stop(); rec = null; syncRec();
+}
+async function saveRecording(blob) {
+  if (!blob.size) { flash('⚠ nothing was recorded'); return; }
+  const ext = /mp4/.test(blob.type) ? 'mp4' : 'webm';
+  flash('💾 saving the recording…', 0);
+  try {
+    const res = await fetch(`/api/save-recording?ext=${ext}`, { method: 'POST', headers: { 'X-Anime-Frame': '1' }, body: blob });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(j.error || `save failed (${res.status})`);
+    flash(`💾 saved to <b>${esc(j.path)}</b>`, 10000);
+  } catch (e) {   // server unavailable: let the browser download it instead
+    const a = Object.assign(document.createElement('a'), { href: URL.createObjectURL(blob), download: `anime-frame-${Date.now()}.${ext}` });
+    a.click();
+    flash(`💾 downloaded through the browser (${esc(e.message || e)})`, 10000);
+  }
+}
+$('rec').onclick = () => (rec ? stopRecording() : startRecording());
+
+/* ---------------- source controls ---------------- */
+$('go').onclick = () => useCamera().catch(e => $('err').textContent = 'Camera error: ' + e.message);
+const pick = () => $('file').click();
+$('goFile').onclick = pick;
+$('upload').onclick = pick;
+$('file').onchange = (e) => { const f = e.target.files[0]; e.target.value = ''; if (f) openFile(f); };
+$('useCam').onclick = () => useCamera().catch(e => flash('⚠ camera error: ' + esc(e.message)));
+$('pause').onclick = () => {
+  if (video.paused) { video.play(); $('pause').textContent = '⏸ Pause'; } else { video.pause(); $('pause').textContent = '▶ Play'; }
+};
+// drag and drop a video anywhere
+let dragDepth = 0;
+addEventListener('dragenter', (e) => { if ([...e.dataTransfer.types].includes('Files')) { dragDepth++; document.body.classList.add('dragging'); } });
+addEventListener('dragleave', () => { if (--dragDepth <= 0) { dragDepth = 0; document.body.classList.remove('dragging'); } });
+addEventListener('dragover', (e) => e.preventDefault());
+addEventListener('drop', (e) => {
+  e.preventDefault(); dragDepth = 0; document.body.classList.remove('dragging');
+  const f = e.dataTransfer.files[0]; if (f) openFile(f);
+});
+
+/* ---------------- look, prompt, mode ---------------- */
+const reconnect = () => { live.st.err = ''; retryAt = 0; live.disconnect(); };   // next frame reconnects as needed
+const setLook = (v) => { look = v; $('look').value = v; store.set('look', v); live.st.err = ''; retryAt = 0; };
+$('look').value = look;
+$('look').onchange = (e) => {
+  if (e.target.value === 'custom' && !customPrompt) { $('look').value = look; $('prompt').focus(); flash('✏️ type a prompt and press <b>Apply</b>', 4000); return; }
+  setLook(e.target.value);
+  if (look !== 'filter') live.setPrompt(spec());   // live change; no-op if not connected yet
+};
+$('prompt').value = customPrompt;
+$('enhance').checked = customEnhance;
+$('promptForm').onsubmit = (e) => {
+  e.preventDefault();
+  const text = $('prompt').value.trim();
+  if (!text) { $('prompt').focus(); return; }
+  customPrompt = text; customEnhance = $('enhance').checked;
+  store.set('prompt', customPrompt); store.set('enhance', customEnhance ? '1' : '0');
+  setLook('custom');
+  if (live.st.rt) live.setPrompt(spec()); else flash('✏️ prompt saved; it applies when Decart connects (make an L-frame or press Full frame)', 5000);
+};
+const tip = $('tip');
+$('tipBtn').onclick = () => { tip.classList.toggle('open'); $('tipBtn').setAttribute('aria-expanded', String(tip.classList.contains('open'))); };
+
+const fastBtn = $('fast');
+const syncFast = () => fastBtn.setAttribute('aria-pressed', String(fast));
+fastBtn.onclick = () => { fast = !fast; store.set('fast', fast ? '1' : '0'); syncFast(); live.st.err = ''; retryAt = 0; };
+syncFast();
+const alwaysBtn = $('always');
+const syncAlways = () => alwaysBtn.setAttribute('aria-pressed', String(fullAnime));
+alwaysBtn.onclick = () => { fullAnime = !fullAnime; syncAlways(); };
+syncAlways();
+$('snap').onclick = () => { const a = document.createElement('a'); a.download = 'anime-frame.png'; a.href = out.toDataURL('image/png'); a.click(); };
+
+/* ---------------- panels (one open at a time) ---------------- */
+const panels = { style: $('styleBtn'), keys: $('keysBtn') };
+function showPanel(id, open) {
+  for (const [pid, btn] of Object.entries(panels)) {
+    const on = pid === id && open;
+    $(pid).hidden = !on; btn.setAttribute('aria-expanded', String(on));
+  }
+  if (id === 'keys' && open) loadKeys();
+}
+for (const [pid, btn] of Object.entries(panels)) btn.onclick = () => showPanel(pid, $(pid).hidden);
+document.querySelectorAll('[data-close]').forEach((b) => { b.onclick = () => showPanel(b.dataset.close, false); });
+addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (tip.classList.contains('open')) { tip.classList.remove('open'); $('tipBtn').setAttribute('aria-expanded', 'false'); return; }
+  showPanel(null, false);
+});
+for (const k of Object.keys(P)) {
+  const el = $('s_' + k);
+  el.value = P[k]; el.oninput = () => P[k] = +el.value;
+}
+
+/* ---------------- Decart keys (kept by the local server; the page sees masked values only) ---------------- */
+let keySlots = [];
+const keyStatus = {};
+async function loadKeys() {
+  try {
+    const res = await fetch('/api/keys');
+    keySlots = (await res.json()).keys;
+  } catch { keySlots = []; $('keyRows').innerHTML = '<span class="bad" style="grid-column:1/-1">couldn\'t reach serve.py</span>'; return; }
+  renderKeys();
+}
+function renderKeys() {
+  $('keyRows').innerHTML = keySlots.map((k) => `
+    <span>${k.index + 1}</span>
+    <input id="key${k.index}" type="password" autocomplete="off" spellcheck="false" aria-label="Decart key ${k.index + 1}"
+      placeholder="${k.set ? 'saved · ' + esc(k.masked) : 'paste a Decart API key'}">
+    <button type="button" data-test="${k.index}">Test</button>
+    <button type="button" data-remove="${k.index}" ${k.set ? '' : 'disabled'} aria-label="Remove key ${k.index + 1}">✕</button>
+    <span class="kstat" id="kstat${k.index}">${keyStatus[k.index] || ''}</span>`).join('');
+}
+function setKeyStatus(i, html) { keyStatus[i] = html; const el = $('kstat' + i); if (el) el.innerHTML = html; }
+async function saveKeys(only) {
+  const set = {};
+  for (const k of keySlots) {
+    if (only !== undefined && k.index !== only) continue;
+    const v = $('key' + k.index)?.value.trim();
+    if (v) set[k.index] = v;
+  }
+  if (!Object.keys(set).length) return true;
+  const res = await post('/api/keys', { set });
+  const j = await res.json().catch(() => ({}));
+  if (!res.ok) { flash(`⚠ ${esc(j.error || 'could not save keys')}`); return false; }
+  keySlots = j.keys; renderKeys(); live.resetKeys();
+  return true;
+}
+$('keysSave').onclick = async () => { if (await saveKeys()) flash('🔑 keys saved', 3000); };
+$('keyRows').onclick = async (e) => {
+  const t = e.target.closest('button'); if (!t) return;
+  if (t.dataset.remove !== undefined) {
+    const i = +t.dataset.remove;
+    const res = await post('/api/keys', { remove: [i] });
+    if (res.ok) { keySlots = (await res.json()).keys; delete keyStatus[i]; renderKeys(); live.resetKeys(); }
+    return;
+  }
+  if (t.dataset.test !== undefined) {
+    const i = +t.dataset.test;
+    if (!(await saveKeys(i))) return;                       // test what's typed, if anything
+    if (!keySlots[i]?.set) { setKeyStatus(i, '<span class="bad">paste a key first</span>'); return; }
+    t.disabled = true; setKeyStatus(i, `testing${fast ? ' (fast mode)' : ''}…`);
+    const r = await testConnection(i, fast).catch((err) => ({ ok: false, error: err.message || String(err) }));
+    t.disabled = false;
+    setKeyStatus(i, r.ok ? `<span class="ok">✓ live session connected in ${(r.ms / 1000).toFixed(1)} s</span>` : `<span class="bad">✗ ${esc(r.error)}</span>`);
+  }
+};
+
+if (query.get('src')) {                 // test hook: ?src=clip.mp4 plays a file instead of the webcam
+  window.__af = { frame, openFile, startRecording, stopRecording, state: () => ({ hands: !!landmarker, seg: !!segmenter, quad: !!quad, mode: tracker.mode, source, mirror,
+    size: [video.videoWidth, video.videoHeight], camLive: camStream?.getVideoTracks()[0]?.readyState, notice, rec: !!rec, look,
+    live: { state: live.st.state, err: live.st.err, ready: live.ready(), fast: live.st.fast, tag: live.st.tag, key: live.st.key, w: liveVid.videoWidth, h: liveVid.videoHeight } }) };
+  playURL(query.get('src'), query.get('src').split('/').pop());
+}
+</script>
+</body>
+</html>
